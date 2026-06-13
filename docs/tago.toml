@@ -1,0 +1,10 @@
+title       = "npmjs"
+baseURL     = "https://npmjs-cli.tamnd.com/"
+description = "Browse the npm JavaScript package registry"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/npmjs-cli"
