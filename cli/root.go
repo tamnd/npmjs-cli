@@ -4,6 +4,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
@@ -44,7 +45,12 @@ func codeError(code int, err error) error { return &ExitError{Code: code, Err: e
 // App holds shared state threaded through every command.
 type App struct {
 	client *npmjs.Client
-	cfg    npmjs.Config
+
+	// client config flags
+	rate      time.Duration
+	timeout   time.Duration
+	retries   int
+	userAgent string
 
 	output   string
 	fields   []string
@@ -56,7 +62,12 @@ type App struct {
 
 // Root builds the root command and its subtree.
 func Root() *cobra.Command {
-	app := &App{cfg: npmjs.DefaultConfig()}
+	app := &App{
+		rate:      200 * time.Millisecond,
+		timeout:   30 * time.Second,
+		retries:   3,
+		userAgent: "",
+	}
 
 	root := &cobra.Command{
 		Use:   "npmjs",
@@ -81,18 +92,15 @@ npmjs is an independent tool and is not affiliated with npm, Inc. or GitHub.`,
 	pf.IntVarP(&app.limit, "limit", "n", 0, "limit number of records (0 = command default)")
 	pf.BoolVarP(&app.quiet, "quiet", "q", false, "suppress progress on stderr")
 
-	pf.IntVarP(&app.cfg.Workers, "workers", "j", app.cfg.Workers, "concurrent fetches")
-	pf.DurationVar(&app.cfg.Rate, "delay", app.cfg.Rate, "minimum spacing between requests")
-	pf.DurationVar(&app.cfg.Timeout, "timeout", app.cfg.Timeout, "per-request timeout")
-	pf.IntVar(&app.cfg.Retries, "retries", app.cfg.Retries, "retry attempts on 429/5xx")
-	pf.StringVar(&app.cfg.UserAgent, "user-agent", app.cfg.UserAgent, "User-Agent sent with each request")
+	pf.DurationVar(&app.rate, "delay", app.rate, "minimum spacing between requests")
+	pf.DurationVar(&app.timeout, "timeout", app.timeout, "per-request timeout")
+	pf.IntVar(&app.retries, "retries", app.retries, "retry attempts on 429/5xx")
+	pf.StringVar(&app.userAgent, "user-agent", app.userAgent, "User-Agent sent with each request")
 
 	root.AddCommand(
 		app.searchCmd(),
 		app.packageCmd(),
-		app.versionsCmd(),
-		app.depsCmd(),
-		app.downloadsCmd(),
+		app.versionCmd(),
 		newVersionCmd(),
 	)
 	return root
@@ -109,7 +117,17 @@ func (a *App) setup() error {
 	if !Format(a.output).Valid() {
 		return codeError(exitUsage, fmt.Errorf("unknown output format %q", a.output))
 	}
-	a.client = npmjs.NewClient(a.cfg)
+	c := npmjs.NewClient()
+	if a.userAgent != "" {
+		c.UserAgent = a.userAgent
+	}
+	if a.rate > 0 {
+		c.Rate = a.rate
+	}
+	if a.retries > 0 {
+		c.Retries = a.retries
+	}
+	a.client = c
 	return nil
 }
 
