@@ -1,9 +1,7 @@
 // Package npmjs is the library behind the npmjs command: the HTTP client,
 // request shaping, and the typed data models for the npm registry.
 //
-// Two APIs: the npm Registry at registry.npmjs.org for package metadata, and
-// the Downloads API at api.npmjs.org for install counts. Both are open, no
-// key required.
+// The npm Registry at registry.npmjs.org is open; no key required.
 package npmjs
 
 import (
@@ -19,63 +17,219 @@ import (
 	"time"
 )
 
-const (
-	registryBase  = "https://registry.npmjs.org"
-	downloadsBase = "https://api.npmjs.org"
-)
+// Host is the canonical npm registry hostname.
+const Host = "registry.npmjs.org"
 
-// DefaultUserAgent identifies the client to the npm registry.
-const DefaultUserAgent = "npmjs/dev (+https://github.com/tamnd/npmjs-cli)"
+const (
+	registryBase     = "https://" + Host
+	defaultUserAgent = "npmjs-cli/dev (+https://github.com/tamnd/npmjs-cli)"
+	defaultRate      = 200 * time.Millisecond
+	defaultTimeout   = 30 * time.Second
+	defaultRetries   = 3
+)
 
 // ErrNotFound is returned when the registry returns 404 or null for a package.
 var ErrNotFound = errors.New("not found")
 
-// Config holds constructor parameters.
-type Config struct {
+// Client talks to the npm Registry API.
+type Client struct {
+	http      *http.Client
+	userAgent string
+	rate      time.Duration
+	retries   int
+	mu        sync.Mutex
+	last      time.Time
 	UserAgent string
 	Rate      time.Duration
 	Retries   int
-	Workers   int
-	Timeout   time.Duration
 }
 
-// DefaultConfig returns sensible defaults for the npm registry.
-func DefaultConfig() Config {
-	return Config{
-		UserAgent: DefaultUserAgent,
-		Rate:      100 * time.Millisecond,
-		Retries:   3,
-		Workers:   8,
-		Timeout:   30 * time.Second,
-	}
-}
-
-// Client talks to the npm Registry and Downloads APIs.
-type Client struct {
-	httpClient *http.Client
-	userAgent  string
-	rate       time.Duration
-	retries    int
-	workers    int
-	mu         sync.Mutex
-	last       time.Time
-}
-
-// NewClient returns a Client with the given config.
-func NewClient(cfg Config) *Client {
+// NewClient returns a Client with sensible defaults.
+func NewClient() *Client {
 	return &Client{
-		httpClient: &http.Client{Timeout: cfg.Timeout},
-		userAgent:  cfg.UserAgent,
-		rate:       cfg.Rate,
-		retries:    cfg.Retries,
-		workers:    cfg.Workers,
+		http:      &http.Client{Timeout: defaultTimeout},
+		userAgent: defaultUserAgent,
+		rate:      defaultRate,
+		retries:   defaultRetries,
+		UserAgent: defaultUserAgent,
+		Rate:      defaultRate,
+		Retries:   defaultRetries,
 	}
 }
 
-// get fetches a URL with pacing and retries.
+// SearchPackages queries /-/v1/search?text={query}&size={limit}.
+func (c *Client) SearchPackages(ctx context.Context, query string, limit int) ([]SearchResult, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 250 {
+		limit = 250
+	}
+	params := url.Values{}
+	params.Set("text", query)
+	params.Set("size", fmt.Sprintf("%d", limit))
+	rawURL := registryBase + "/-/v1/search?" + params.Encode()
+
+	var resp wireSearchResult
+	if err := c.getJSON(ctx, rawURL, &resp); err != nil {
+		return nil, err
+	}
+	out := make([]SearchResult, 0, len(resp.Objects))
+	for _, obj := range resp.Objects {
+		out = append(out, SearchResult{
+			Name:        obj.Package.Name,
+			Version:     obj.Package.Version,
+			Description: obj.Package.Description,
+			Score:       obj.Score.Final,
+			Date:        obj.Package.Date,
+		})
+	}
+	return out, nil
+}
+
+// GetPackage fetches full package metadata from /{name}.
+func (c *Client) GetPackage(ctx context.Context, name string) (*Package, error) {
+	rawURL := registryBase + "/" + url.PathEscape(name)
+	var doc wirePackage
+	if err := c.getJSON(ctx, rawURL, &doc); err != nil {
+		return nil, err
+	}
+	if doc.DistTags.Latest == "" {
+		return nil, fmt.Errorf("package %q: no latest version: %w", name, ErrNotFound)
+	}
+	return &Package{
+		Name:        doc.Name,
+		Version:     doc.DistTags.Latest,
+		Description: doc.Description,
+		License:     doc.License,
+		Homepage:    doc.Homepage,
+		Repository:  extractRepo(doc.Repository),
+		Keywords:    doc.Keywords,
+		Author:      extractAuthor(doc.Author),
+	}, nil
+}
+
+// GetVersion fetches metadata for a specific version from /{name}/{version}.
+func (c *Client) GetVersion(ctx context.Context, name, version string) (*PackageVersion, error) {
+	rawURL := registryBase + "/" + url.PathEscape(name) + "/" + url.PathEscape(version)
+	var doc wireVersion
+	if err := c.getJSON(ctx, rawURL, &doc); err != nil {
+		return nil, err
+	}
+	return &PackageVersion{
+		Name:         doc.Name,
+		Version:      doc.Version,
+		License:      doc.License,
+		Main:         doc.Main,
+		UnpackedSize: doc.Dist.UnpackedSize,
+	}, nil
+}
+
+// ─── wire types ──────────────────────────────────────────────────────────────
+
+// wirePackage is the full package document from /{name}.
+type wirePackage struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	License     string          `json:"license"`
+	Homepage    string          `json:"homepage"`
+	Repository  json.RawMessage `json:"repository"` // can be string or {"type":"git","url":"..."}
+	Keywords    []string        `json:"keywords"`
+	Author      json.RawMessage `json:"author"` // can be string or {"name":"...","email":"..."}
+	DistTags    struct {
+		Latest string `json:"latest"`
+	} `json:"dist-tags"`
+	Versions map[string]struct{} `json:"versions"` // just keys, don't decode values
+}
+
+// wireVersion is the response from /{name}/{version}.
+type wireVersion struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	License string `json:"license"`
+	Main    string `json:"main"`
+	Dist    struct {
+		UnpackedSize int64 `json:"unpackedSize"`
+	} `json:"dist"`
+}
+
+// wireSearchResult is the top-level response from /-/v1/search.
+type wireSearchResult struct {
+	Objects []struct {
+		Package struct {
+			Name        string `json:"name"`
+			Version     string `json:"version"`
+			Description string `json:"description"`
+			Date        string `json:"date"`
+		} `json:"package"`
+		Score struct {
+			Final float64 `json:"final"`
+		} `json:"score"`
+	} `json:"objects"`
+	Total int `json:"total"`
+}
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+// extractRepo extracts repository URL from the raw JSON field (string or object).
+func extractRepo(raw json.RawMessage) string {
+	if raw == nil {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var obj struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		return obj.URL
+	}
+	return ""
+}
+
+// extractAuthor extracts an author name from the raw JSON field (string or object).
+func extractAuthor(raw json.RawMessage) string {
+	if raw == nil {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var obj struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		return obj.Name
+	}
+	return ""
+}
+
+// ─── HTTP internals ──────────────────────────────────────────────────────────
+
+func (c *Client) getJSON(ctx context.Context, rawURL string, v any) error {
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(body)) == "null" {
+		return ErrNotFound
+	}
+	if err := json.Unmarshal(body, v); err != nil {
+		return fmt.Errorf("decode %s: %w", rawURL, err)
+	}
+	return nil
+}
+
 func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
+	retries := c.retries
+	if retries <= 0 {
+		retries = defaultRetries
+	}
 	var lastErr error
-	for attempt := 0; attempt <= c.retries; attempt++ {
+	for attempt := 0; attempt <= retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -101,10 +255,14 @@ func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.userAgent)
+	ua := c.UserAgent
+	if ua == "" {
+		ua = c.userAgent
+	}
+	req.Header.Set("User-Agent", ua)
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -127,12 +285,16 @@ func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 }
 
 func (c *Client) pace() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.rate <= 0 {
+	rate := c.Rate
+	if rate <= 0 {
+		rate = c.rate
+	}
+	if rate <= 0 {
 		return
 	}
-	if wait := c.rate - time.Since(c.last); wait > 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if wait := rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -144,94 +306,4 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
-}
-
-// getJSON fetches and JSON-decodes into v. Returns ErrNotFound when the body is null.
-func (c *Client) getJSON(ctx context.Context, rawURL string, v any) error {
-	body, err := c.get(ctx, rawURL)
-	if err != nil {
-		return err
-	}
-	trimmed := strings.TrimSpace(string(body))
-	if trimmed == "null" {
-		return ErrNotFound
-	}
-	if err := json.Unmarshal(body, v); err != nil {
-		return fmt.Errorf("decode %s: %w", rawURL, err)
-	}
-	return nil
-}
-
-// Search queries the npm registry search endpoint.
-func (c *Client) Search(ctx context.Context, query string, limit int) ([]Package, error) {
-	size := limit
-	if size <= 0 {
-		size = 20
-	}
-	if size > 250 {
-		size = 250
-	}
-
-	params := url.Values{}
-	params.Set("text", query)
-	params.Set("size", fmt.Sprintf("%d", size))
-
-	rawURL := registryBase + "/-/v1/search?" + params.Encode()
-	var resp searchResp
-	if err := c.getJSON(ctx, rawURL, &resp); err != nil {
-		return nil, err
-	}
-	return wireSearchToPackages(resp, limit), nil
-}
-
-// Package fetches full package metadata and returns one Package record.
-func (c *Client) Package(ctx context.Context, name string) (Package, error) {
-	rawURL := registryBase + "/" + url.PathEscape(name)
-	var doc pkgDoc
-	if err := c.getJSON(ctx, rawURL, &doc); err != nil {
-		return Package{}, err
-	}
-	if doc.DistTags["latest"] == "" {
-		return Package{}, fmt.Errorf("package %q: no latest version: %w", name, ErrNotFound)
-	}
-	return wireDocToPackage(doc), nil
-}
-
-// Versions fetches the version history for a package and returns VersionInfo records.
-func (c *Client) Versions(ctx context.Context, name string, limit int) ([]VersionInfo, error) {
-	rawURL := registryBase + "/" + url.PathEscape(name)
-	var doc pkgDoc
-	if err := c.getJSON(ctx, rawURL, &doc); err != nil {
-		return nil, err
-	}
-	return wireDocToVersions(doc, limit), nil
-}
-
-// Deps fetches the dependencies of the latest version of a package.
-func (c *Client) Deps(ctx context.Context, name string) ([]Dep, error) {
-	rawURL := registryBase + "/" + url.PathEscape(name)
-	var doc pkgDoc
-	if err := c.getJSON(ctx, rawURL, &doc); err != nil {
-		return nil, err
-	}
-	latest := doc.DistTags["latest"]
-	if latest == "" {
-		return nil, fmt.Errorf("package %q: no latest version: %w", name, ErrNotFound)
-	}
-	manifest, ok := doc.Versions[latest]
-	if !ok {
-		return nil, fmt.Errorf("package %q version %q not found: %w", name, latest, ErrNotFound)
-	}
-	return wireManifestToDeps(manifest), nil
-}
-
-// Downloads fetches download statistics for a package and period.
-// period is one of: last-day, last-week, last-month, last-year.
-func (c *Client) Downloads(ctx context.Context, name string, period string) (DownloadStat, error) {
-	rawURL := downloadsBase + "/downloads/point/" + period + "/" + url.PathEscape(name)
-	var resp dlResp
-	if err := c.getJSON(ctx, rawURL, &resp); err != nil {
-		return DownloadStat{}, err
-	}
-	return wireDownloadToStat(resp, period), nil
 }
